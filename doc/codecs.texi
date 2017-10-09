@@ -1279,6 +1279,20 @@ ffprobe -dump_separator "
 Maximum number of pixels per image. This value can be used to avoid out of
 memory failures due to large images.
 
+@item  -hwaccel_flags  @var{flags} (@emph{decoding,video})
+Possible values:
+@table @samp
+@item ignore_level
+ignore level even if the codec level used is unknown or higher than the maximum
+supported level reported by the hardware driver
+@item allow_high_depth
+allow to output YUV pixel formats with a different chroma sampling than 4:2:0
+and/or other than 8 bits per component
+@item allow_profile_mismatch
+attempt to decode anyway if HW accelerated decoder's supported profiles do not
+exactly match the stream
+@end table
+
 @item apply_cropping @var{bool} (@emph{decoding,video})
 Enable cropping if cropping parameters are multiples of the required
 alignment for the left and top parameters. If the alignment is not met the
