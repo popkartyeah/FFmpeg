@@ -1031,7 +1031,7 @@ static void vaapi_encode_h264_add_reference (AVCodecContext *avctx,
 
 
 static int vaapi_encode_h264_get_next(AVCodecContext *avctx,
-                                 VAAPIEncodePicture **pic_out)
+                                      VAAPIEncodePicture **pic_out)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VAAPIEncodeH264Context *priv = ctx->priv_data;
