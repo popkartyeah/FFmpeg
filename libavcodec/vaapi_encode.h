@@ -79,9 +79,11 @@ typedef struct VAAPIEncodePicture {
     void           *priv_data;
     void           *codec_picture_params;
 
-    int          nb_refs;
     int          ref_count;
+
+    int          nb_refs;
     struct VAAPIEncodePicture *refs[MAX_PICTURE_REFERENCES];
+
 
     int          nb_slices;
     VAAPIEncodeSlice *slices;
