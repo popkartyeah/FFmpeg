@@ -108,6 +108,7 @@ static int vaapi_encode_wait(AVCodecContext *avctx,
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VAStatus vas;
+    int i;
 
     av_assert0(pic->encode_issued);
 
@@ -131,6 +132,9 @@ static int vaapi_encode_wait(AVCodecContext *avctx,
     av_frame_free(&pic->input_image);
 
     pic->encode_complete = 1;
+    for (i = 0; i < pic->nb_refs; i++) {
+        pic->refs[i]->ref_count --;
+    }
     return 0;
 }
 
@@ -460,8 +464,8 @@ fail_at_end:
     return err;
 }
 
-static int vaapi_encode_output(AVCodecContext *avctx,
-                               VAAPIEncodePicture *pic, AVPacket *pkt)
+int vaapi_encode_output(AVCodecContext *avctx,
+		        VAAPIEncodePicture *pic, AVPacket *pkt)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VACodedBufferSegment *buf_list, *buf;
@@ -538,7 +542,7 @@ static int vaapi_encode_discard(AVCodecContext *avctx,
     return 0;
 }
 
-static VAAPIEncodePicture *vaapi_encode_alloc(void)
+VAAPIEncodePicture *vaapi_encode_alloc(void)
 {
     VAAPIEncodePicture *pic;
 
@@ -553,8 +557,8 @@ static VAAPIEncodePicture *vaapi_encode_alloc(void)
     return pic;
 }
 
-static int vaapi_encode_free(AVCodecContext *avctx,
-                             VAAPIEncodePicture *pic)
+int vaapi_encode_free(AVCodecContext *avctx,
+                      VAAPIEncodePicture *pic)
 {
     int i;
 
@@ -585,8 +589,8 @@ static int vaapi_encode_free(AVCodecContext *avctx,
     return 0;
 }
 
-static int vaapi_encode_step(AVCodecContext *avctx,
-                             VAAPIEncodePicture *target)
+int vaapi_encode_step(AVCodecContext *avctx,
+                      VAAPIEncodePicture *target)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VAAPIEncodePicture *pic;
@@ -1111,6 +1115,8 @@ static av_cold int vaapi_encode_config_attributes(AVCodecContext *avctx)
                 err = AVERROR(EINVAL);
                 goto fail;
             }
+	    ctx->max_ref_l0 = ref_l0;
+	    ctx->max_ref_l1 = ref_l1;
         }
         break;
         case VAConfigAttribEncPackedHeaders:
@@ -1354,6 +1360,7 @@ static av_cold int vaapi_encode_create_recon_frames(AVCodecContext *avctx)
     // At most three IDR/I/P frames and two runs of B frames can be in
     // flight at any one time.
     ctx->recon_frames->initial_pool_size = 3 + 2 * avctx->max_b_frames;
+    ctx->recon_frames->initial_pool_size += ctx->max_ref_l0 + ctx->max_ref_l1;
 
     err = av_hwframe_ctx_init(ctx->recon_frames_ref);
     if (err < 0) {
