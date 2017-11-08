@@ -996,7 +996,7 @@ static av_cold int vaapi_encode_h264_close(AVCodecContext *avctx)
 }
 
 static void vaapi_encode_h264_add_reference (AVCodecContext *avctx,
-        VAAPIEncodePicture *pic)
+                                             VAAPIEncodePicture *pic)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VAAPIEncodeH264Context *priv = ctx->priv_data;
