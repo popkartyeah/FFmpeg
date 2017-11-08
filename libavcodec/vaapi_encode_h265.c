@@ -684,59 +684,12 @@ static int vaapi_encode_h265_init_slice_params(AVCodecContext *avctx,
 
     if (pic->type != PICTURE_TYPE_IDR) {
         H265RawSTRefPicSet *rps;
-        VAAPIEncodePicture *st;
-        int used;
 
         sh->short_term_ref_pic_set_sps_flag = 0;
 
         rps = &sh->short_term_ref_pic_set;
         memset(rps, 0, sizeof(*rps));
-#if 0
-        for (st = ctx->pic_start; st; st = st->next) {
-            if (st->encode_order >= pic->encode_order) {
-                // Not yet in DPB.
-                continue;
-            }
-            used = 0;
-            for (i = 0; i < pic->nb_refs; i++) {
-                if (pic->refs[i] == st)
-                    used = 1;
-            }
-            if (!used) {
-                // Usually each picture always uses all of the others in the
-                // DPB as references.  The one case we have to treat here is
-                // a non-IDR IRAP picture, which may need to hold unused
-                // references across itself to be used for the decoding of
-                // following RASL pictures.  This looks for such an RASL
-                // picture, and keeps the reference if there is one.
-                VAAPIEncodePicture *rp;
-                for (rp = ctx->pic_start; rp; rp = rp->next) {
-                    if (rp->encode_order < pic->encode_order)
-                        continue;
-                    if (rp->type != PICTURE_TYPE_B)
-                        continue;
-                    if (rp->refs[0] == st && rp->refs[1] == pic)
-                        break;
-                }
-                if (!rp)
-                    continue;
-            }
-            // This only works for one instance of each (delta_poc_sN_minus1
-            // is relative to the previous frame in the list, not relative to
-            // the current frame directly).
-            if (st->display_order < pic->display_order) {
-                rps->delta_poc_s0_minus1[rps->num_negative_pics] =
-                    pic->display_order - st->display_order - 1;
-                rps->used_by_curr_pic_s0_flag[rps->num_negative_pics] = used;
-                ++rps->num_negative_pics;
-            } else {
-                rps->delta_poc_s1_minus1[rps->num_positive_pics] =
-                    st->display_order - pic->display_order - 1;
-                rps->used_by_curr_pic_s1_flag[rps->num_positive_pics] = used;
-                ++rps->num_positive_pics;
-            }
-        }
-#else
+
         if (pic->type != PICTURE_TYPE_B) {
             rps->num_negative_pics = pic->nb_refs;
             for (i = 0 ; i < rps->num_negative_pics; i++) {
@@ -768,8 +721,7 @@ static int vaapi_encode_h265_init_slice_params(AVCodecContext *avctx,
                          vpic->reference_frames[pic->nb_refs - 2 - i].pic_order_cnt - 1;
                 }
             }
-       }
-#endif
+        }
         sh->num_long_term_sps  = 0;
         sh->num_long_term_pics = 0;
 
@@ -1016,7 +968,7 @@ static av_cold int vaapi_encode_h265_close(AVCodecContext *avctx)
 }
 
 static void vaapi_encode_h265_add_reference (AVCodecContext *avctx,
-        VAAPIEncodePicture *pic)
+                                             VAAPIEncodePicture *pic)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VAAPIEncodeH265Context *priv = ctx->priv_data;
@@ -1050,7 +1002,7 @@ static void vaapi_encode_h265_add_reference (AVCodecContext *avctx,
 }
 
 static int vaapi_encode_h265_get_next(AVCodecContext *avctx,
-                                 VAAPIEncodePicture **pic_out)
+                                      VAAPIEncodePicture **pic_out)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VAAPIEncodeH265Context *priv = ctx->priv_data;
@@ -1272,9 +1224,9 @@ static int vaapi_encode_h265_truncate_gop(AVCodecContext *avctx)
 }
 
 static av_cold int vaapi_encode_h265_encode(AVCodecContext *avctx,
-                                           AVPacket *pkt,
-                                           const AVFrame *input_image,
-                                           int *got_packet)
+                                            AVPacket *pkt,
+                                            const AVFrame *input_image,
+                                            int *got_packet)
 {
     VAAPIEncodeContext *ctx = avctx->priv_data;
     VAAPIEncodePicture *pic;
