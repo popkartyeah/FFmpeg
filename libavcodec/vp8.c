@@ -167,6 +167,30 @@ static VP8Frame *vp8_find_free_buffer(VP8Context *s)
     return frame;
 }
 
+static enum AVPixelFormat get_pixel_format(VP8Context *s)
+{
+    enum AVPixelFormat fmt;
+    enum AVPixelFormat pix_fmts[] = {
+#if CONFIG_VP8_VAAPI_HWACCEL
+        AV_PIX_FMT_VAAPI,
+#endif
+#if CONFIG_VP8_NVDEC_HWACCEL
+        AV_PIX_FMT_CUDA,
+#endif
+        AV_PIX_FMT_YUV420P,
+        AV_PIX_FMT_NONE,
+    };
+
+    fmt = ff_get_format(s->avctx, pix_fmts);
+    if (fmt < 0) {
+        fmt = AV_PIX_FMT_NONE;
+        av_log(s->avctx, AV_LOG_ERROR,
+               "Can not support the format. \n");
+    }
+
+    return fmt;
+}
+
 static av_always_inline
 int update_dimensions(VP8Context *s, int width, int height, int is_vp7)
 {
@@ -180,6 +204,15 @@ int update_dimensions(VP8Context *s, int width, int height, int is_vp7)
         ret = ff_set_dimensions(s->avctx, width, height);
         if (ret < 0)
             return ret;
+    }
+
+    if (!is_vp7) {
+        s->pix_fmt = get_pixel_format(s);
+        if (s->pix_fmt < 0) {
+            ret = AVERROR(EINVAL);
+            return ret;
+        }
+        avctx->pix_fmt = s->pix_fmt;
     }
 
     s->mb_width  = (s->avctx->coded_width  + 15) / 16;
@@ -2598,18 +2631,7 @@ int vp78_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     if (s->actually_webp) {
         // avctx->pix_fmt already set in caller.
     } else if (!is_vp7 && s->pix_fmt == AV_PIX_FMT_NONE) {
-        enum AVPixelFormat pix_fmts[] = {
-#if CONFIG_VP8_VAAPI_HWACCEL
-            AV_PIX_FMT_VAAPI,
-#endif
-#if CONFIG_VP8_NVDEC_HWACCEL
-            AV_PIX_FMT_CUDA,
-#endif
-            AV_PIX_FMT_YUV420P,
-            AV_PIX_FMT_NONE,
-        };
-
-        s->pix_fmt = ff_get_format(s->avctx, pix_fmts);
+        s->pix_fmt = get_pixel_format(s);
         if (s->pix_fmt < 0) {
             ret = AVERROR(EINVAL);
             goto err;
