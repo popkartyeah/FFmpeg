@@ -40,6 +40,8 @@ enum {
     SEI_RECOVERY_POINT = 0x04,
 };
 
+static const char *picture_type_name[] = { "IDR", "I", "P", "B" };
+
 // Random (version 4) ISO 11578 UUID.
 static const uint8_t vaapi_encode_h264_sei_identifier_uuid[16] = {
     0x59, 0x94, 0x8b, 0x28, 0x11, 0xec, 0x45, 0xaf,
@@ -83,6 +85,11 @@ typedef struct VAAPIEncodeH264Context {
     int aud_needed;
     int sei_needed;
     int sei_cbr_workaround_needed;
+
+    // reference frames param
+    struct VAAPIEncodePicture *references[MAX_PICTURE_REFERENCES];
+    int ref_nr;
+    int max_ref_nr;
 } VAAPIEncodeH264Context;
 
 typedef struct VAAPIEncodeH264Options {
@@ -318,9 +325,7 @@ static int vaapi_encode_h264_init_sequence_params(AVCodecContext *avctx)
     sps->log2_max_pic_order_cnt_lsb_minus4 =
         av_clip(av_log2(ctx->b_per_p + 1) - 2, 0, 12);
 
-    sps->max_num_ref_frames =
-        (avctx->profile & FF_PROFILE_H264_INTRA) ? 0 :
-        1 + (ctx->b_per_p > 0);
+    sps->max_num_ref_frames = (avctx->profile & FF_PROFILE_H264_INTRA) ? 0 : priv->max_ref_nr;
 
     sps->pic_width_in_mbs_minus1        = priv->mb_width  - 1;
     sps->pic_height_in_map_units_minus1 = priv->mb_height - 1;
@@ -757,19 +762,23 @@ static int vaapi_encode_h264_init_slice_params(AVCodecContext *avctx,
         vslice->RefPicList1[i].flags      = VA_PICTURE_H264_INVALID;
     }
 
-    av_assert0(pic->nb_refs <= 2);
-    if (pic->nb_refs >= 1) {
-        // Backward reference for P- or B-frame.
-        av_assert0(pic->type == PICTURE_TYPE_P ||
-                   pic->type == PICTURE_TYPE_B);
-        vslice->RefPicList0[0] = vpic->ReferenceFrames[0];
-    }
-    if (pic->nb_refs >= 2) {
-        // Forward reference for B-frame.
-        av_assert0(pic->type == PICTURE_TYPE_B);
-        vslice->RefPicList1[0] = vpic->ReferenceFrames[1];
+    sh->num_ref_idx_active_override_flag = 1;
+
+    if (pic->type == PICTURE_TYPE_P) {
+        for (i = 0; i < pic->nb_refs; i++)
+            vslice->RefPicList0[i] = vpic->ReferenceFrames[pic->nb_refs - 1 - i];
+	sh->num_ref_idx_l0_active_minus1 = pic->nb_refs - 1;
     }
 
+    if (pic->type == PICTURE_TYPE_B) {
+        for (i = 0; i < pic->nb_refs - 1; i++)
+            vslice->RefPicList0[i] = vpic->ReferenceFrames[pic->nb_refs - 2 - i];
+        vslice->RefPicList1[0] = vpic->ReferenceFrames[pic->nb_refs - 1];
+        sh->num_ref_idx_l0_active_minus1 = pic->nb_refs - 2;
+    }
+
+    vslice->num_ref_idx_active_override_flag = sh->num_ref_idx_active_override_flag;
+    vslice->num_ref_idx_l0_active_minus1 = sh->num_ref_idx_l0_active_minus1;
     vslice->slice_qp_delta = sh->slice_qp_delta;
 
     return 0;
@@ -854,6 +863,34 @@ static av_cold int vaapi_encode_h264_configure(AVCodecContext *avctx)
         }
     }
 
+    priv->max_ref_nr = avctx->refs;
+
+    if (priv->max_ref_nr > ctx->max_ref_l0 + ctx->max_ref_l1) {
+        av_log(avctx, AV_LOG_WARNING, "Warning: " \
+               "reference frame number exceeds %d" \
+               "correct to %d\n", \
+               ctx->max_ref_l0 + ctx->max_ref_l1,
+               ctx->max_ref_l0 + ctx->max_ref_l1);
+        priv->max_ref_nr = ctx->max_ref_l0 + ctx->max_ref_l1;
+    }
+    if (avctx->max_b_frames && priv->max_ref_nr < 2) {
+        av_log(avctx, AV_LOG_WARNING, "Warning: " \
+               "reference frame number is 1 but b frame encoding is setted," \
+               "correct to 2\n");
+        priv->max_ref_nr = 2;
+    }
+    if (!avctx->max_b_frames && priv->max_ref_nr > ctx->max_ref_l0) {
+        av_log(avctx, AV_LOG_WARNING, "Warning: " \
+               "no b frame, but ref_nr > max_ref_l0" \
+               "correct to %d\n", ctx->max_ref_l0);
+        priv->max_ref_nr = ctx->max_ref_l0;
+    }
+    if (priv->max_ref_nr < 1 && avctx->gop_size) {
+        av_log(avctx, AV_LOG_WARNING, "Warning: " \
+               "reference frame number is %d but gop_size > 0," \
+               "correct to 1\n", priv->max_ref_nr);
+        priv->max_ref_nr = 1;
+    }
     return 0;
 }
 
@@ -983,6 +1020,376 @@ static av_cold int vaapi_encode_h264_close(AVCodecContext *avctx)
     return ff_vaapi_encode_close(avctx);
 }
 
+static void vaapi_encode_h264_add_reference (AVCodecContext *avctx,
+                                             VAAPIEncodePicture *pic)
+{
+    VAAPIEncodeContext *ctx = avctx->priv_data;
+    VAAPIEncodeH264Context *priv = ctx->priv_data;
+    int i;
+
+    av_assert0 (pic->type != PICTURE_TYPE_B);
+
+    if (pic->type == PICTURE_TYPE_IDR) {
+        // clear the reference frame list
+        for (i = 0 ; i < priv->ref_nr; i++) {
+           priv->references[i]->ref_count --;
+           priv->references[i] = NULL;
+        }
+        priv->ref_nr = 0;
+    }
+
+    if (priv->ref_nr == priv->max_ref_nr) {
+        // remove the oldest reference frame
+        for (i = 0 ; i < priv->ref_nr - 1; i++) {
+           priv->references[i]->ref_count --;
+           priv->references[i] = priv->references[i+1];
+           priv->references[i]->ref_count ++;
+        }
+        priv->references[priv->ref_nr-1]->ref_count--;
+        priv->ref_nr --;
+    }
+
+    priv->references[priv->ref_nr] = pic;
+    priv->references[priv->ref_nr]->ref_count ++;
+    priv->ref_nr++;
+}
+
+
+static int vaapi_encode_h264_get_next(AVCodecContext *avctx,
+                                      VAAPIEncodePicture **pic_out)
+{
+    VAAPIEncodeContext *ctx = avctx->priv_data;
+    VAAPIEncodeH264Context *priv = ctx->priv_data;
+    VAAPIEncodePicture *start, *end, *pic;
+    int i,j;
+
+    for (pic = ctx->pic_start; pic; pic = pic->next) {
+        if (pic->next)
+            av_assert0(pic->display_order < pic->next->display_order);
+        if (pic->display_order == ctx->input_order) {
+            *pic_out = pic;
+            return 0;
+        }
+    }
+
+    pic = vaapi_encode_alloc();
+    if (!pic)
+        return AVERROR(ENOMEM);
+
+    if (ctx->input_order == 0 || ctx->force_idr ||
+        ctx->gop_counter >= avctx->gop_size) {
+        pic->type = PICTURE_TYPE_IDR;
+        ctx->force_idr = 0;
+        ctx->gop_counter = 1;
+        ctx->p_counter = 0;
+    } else if (ctx->p_counter >= ctx->p_per_i) {
+        pic->type = PICTURE_TYPE_I;
+        ++ctx->gop_counter;
+        ctx->p_counter = 0;
+    } else {
+        pic->type = PICTURE_TYPE_P;
+        for (i = 0 ; i < priv->ref_nr; i++) {
+            pic->refs[i] = priv->references[i];
+            pic->refs[i]->ref_count++;
+        }
+        pic->nb_refs = priv->ref_nr;
+        ++ctx->gop_counter;
+        ++ctx->p_counter;
+    }
+    start = end = pic;
+    vaapi_encode_h264_add_reference(avctx, pic);
+
+    if (pic->type != PICTURE_TYPE_IDR) {
+        // If that was not an IDR frame, add B-frames display-before and
+        // encode-after it, but not exceeding the GOP size.
+
+        for (i = 0; i < ctx->b_per_p &&
+            ctx->gop_counter < avctx->gop_size; i++) {
+            pic = vaapi_encode_alloc();
+            if (!pic)
+                goto fail;
+
+            pic->type = PICTURE_TYPE_B;
+            for (j = 0 ; j < priv->ref_nr; j++) {
+                pic->refs[j] = priv->references[j];
+                pic->refs[j]->ref_count++;
+            }
+            pic->nb_refs = priv->ref_nr;
+            pic->next = start;
+            pic->display_order = ctx->input_order + ctx->b_per_p - i - 1;
+            pic->encode_order  = pic->display_order + 1;
+            start = pic;
+
+            ++ctx->gop_counter;
+        }
+    }
+
+    if (ctx->input_order == 0) {
+        pic->display_order = 0;
+        pic->encode_order  = 0;
+
+        ctx->pic_start = ctx->pic_end = pic;
+
+    } else {
+        for (i = 0, pic = start; pic; i++, pic = pic->next) {
+            pic->display_order = ctx->input_order + i;
+            if (end->type == PICTURE_TYPE_IDR)
+                pic->encode_order = ctx->input_order + i;
+            else if (pic == end)
+                pic->encode_order = ctx->input_order;
+            else
+                pic->encode_order = ctx->input_order + i + 1;
+        }
+
+        av_assert0(ctx->pic_end);
+        ctx->pic_end->next = start;
+        ctx->pic_end = end;
+    }
+    *pic_out = start;
+
+    av_log(avctx, AV_LOG_DEBUG, "Pictures:");
+    for (pic = ctx->pic_start; pic; pic = pic->next) {
+        av_log(avctx, AV_LOG_DEBUG, " %s (%"PRId64"/%"PRId64")",
+               picture_type_name[pic->type],
+               pic->display_order, pic->encode_order);
+    }
+    av_log(avctx, AV_LOG_DEBUG, "\n");
+
+    return 0;
+
+fail:
+    while (start) {
+        pic = start->next;
+        vaapi_encode_free(avctx, start);
+        start = pic;
+    }
+    return AVERROR(ENOMEM);
+}
+
+static int vaapi_encode_h264_clear_old(AVCodecContext *avctx)
+{
+    VAAPIEncodeContext *ctx = avctx->priv_data;
+    VAAPIEncodePicture *pic, *next;
+    pic = ctx->pic_start;
+    while (pic && pic->next) {
+        if (pic->encode_order > ctx->output_order)
+            break;
+
+        if (pic->ref_count == 0 && pic == ctx->pic_start) {
+            ctx->pic_start = pic->next;
+            vaapi_encode_free(avctx, pic);
+            pic = ctx->pic_start;
+            continue;
+        }
+        next = pic->next;
+
+        if (next->encode_order > ctx->output_order)
+            break;
+        if (next->ref_count == 0) {
+            pic->next = next->next;
+            vaapi_encode_free(avctx, next);
+        }
+        pic = pic->next;
+    }
+    return 0;
+}
+
+static int vaapi_encode_h264_truncate_gop(AVCodecContext *avctx)
+{
+    VAAPIEncodeContext *ctx = avctx->priv_data;
+    VAAPIEncodeH264Context *priv = ctx->priv_data;
+    VAAPIEncodePicture *pic, *last_pic, *next;
+
+    // Find the last picture we actually have input for.
+    for (pic = ctx->pic_start; pic; pic = pic->next) {
+        if (!pic->input_available)
+            break;
+        last_pic = pic;
+    }
+
+    if (pic) {
+        av_assert0(last_pic);
+
+        if (last_pic->type == PICTURE_TYPE_B) {
+            // Some fixing up is required.  Change the type of this
+            // picture to P, then modify preceding B references which
+            // point beyond it to point at it instead.
+            int last_ref = last_pic->nb_refs - 1;
+
+            last_pic->type = PICTURE_TYPE_P;
+            last_pic->encode_order = last_pic->refs[last_ref]->encode_order;
+
+            for (pic = ctx->pic_start; pic != last_pic; pic = pic->next) {
+                 if (pic->type == PICTURE_TYPE_B &&
+                        pic->refs[last_ref] == last_pic->refs[last_ref]) {
+                        if (last_pic->refs[last_ref])
+                           pic->refs[last_ref]->ref_count --;
+                        pic->refs[last_ref] = last_pic;
+                        pic->refs[last_ref]->ref_count ++;
+                 }
+            }
+
+            last_pic->nb_refs = last_pic->refs[last_ref] ?  last_pic->nb_refs - 1 :  last_pic->nb_refs;
+
+            if (last_pic->refs[last_ref])
+                last_pic->refs[last_ref]->ref_count--;
+            last_pic->refs[last_ref] = NULL;
+        } else {
+            // We can use the current structure (no references point
+            // beyond the end), but there are unused pics to discard.
+        }
+
+        // Discard all following pics, they will never be used.
+        for (pic = last_pic->next; pic; pic = next) {
+            int i;
+            int ref_nr = priv->ref_nr;
+            next = pic->next;
+
+            for (i = 0; i < pic->nb_refs; i++) {
+                pic->refs[i]->ref_count--;
+            }
+            for (i = 0 ; i < ref_nr; i++) {
+                if (priv->references[i] == pic) {
+                    priv->references[i]->ref_count--;
+                    priv->references[i] = NULL;
+                    priv->ref_nr --;
+                }
+            }
+            vaapi_encode_free(avctx, pic);
+        }
+
+        last_pic->next = NULL;
+        ctx->pic_end = last_pic;
+
+    } else {
+        // Input is available for all pictures, so we don't need to
+        // mangle anything.
+    }
+
+    av_log(avctx, AV_LOG_DEBUG, "Pictures ending truncated GOP:");
+    for (pic = ctx->pic_start; pic; pic = pic->next) {
+        av_log(avctx, AV_LOG_DEBUG, " %s (%"PRId64"/%"PRId64")",
+               picture_type_name[pic->type],
+               pic->display_order, pic->encode_order);
+    }
+    av_log(avctx, AV_LOG_DEBUG, "\n");
+
+    return 0;
+}
+
+static av_cold int vaapi_encode_h264_encode(AVCodecContext *avctx,
+                                           AVPacket *pkt,
+                                           const AVFrame *input_image,
+                                           int *got_packet)
+{
+    VAAPIEncodeContext *ctx = avctx->priv_data;
+    VAAPIEncodePicture *pic;
+    int err;
+
+    if (input_image) {
+        av_log(avctx, AV_LOG_DEBUG, "Encode frame: %ux%u (%"PRId64").\n",
+               input_image->width, input_image->height, input_image->pts);
+
+        if (input_image->pict_type == AV_PICTURE_TYPE_I) {
+            err = vaapi_encode_h264_truncate_gop(avctx);
+            if (err < 0)
+                goto fail;
+            ctx->force_idr = 1;
+        }
+
+        err = vaapi_encode_h264_get_next(avctx, &pic);
+        if (err) {
+            av_log(avctx, AV_LOG_ERROR, "Input setup failed: %d.\n", err);
+            return err;
+        }
+
+        pic->input_image = av_frame_alloc();
+        if (!pic->input_image) {
+            err = AVERROR(ENOMEM);
+            goto fail;
+        }
+        err = av_frame_ref(pic->input_image, input_image);
+        if (err < 0)
+            goto fail;
+        pic->input_surface = (VASurfaceID)(uintptr_t)input_image->data[3];
+        pic->pts = input_image->pts;
+
+        if (ctx->input_order == 0)
+            ctx->first_pts = pic->pts;
+        if (ctx->input_order == ctx->decode_delay)
+            ctx->dts_pts_diff = pic->pts - ctx->first_pts;
+        if (ctx->output_delay > 0)
+            ctx->ts_ring[ctx->input_order % (3 * ctx->output_delay)] = pic->pts;
+
+        pic->input_available = 1;
+
+    } else {
+        if (!ctx->end_of_stream) {
+            err = vaapi_encode_h264_truncate_gop(avctx);
+            if (err < 0)
+                goto fail;
+            ctx->end_of_stream = 1;
+        }
+    }
+
+    ++ctx->input_order;
+    ++ctx->output_order;
+    av_assert0(ctx->output_order + ctx->output_delay + 1 == ctx->input_order);
+
+    for (pic = ctx->pic_start; pic; pic = pic->next)
+        if (pic->encode_order == ctx->output_order)
+            break;
+
+    // pic can be null here if we don't have a specific target in this
+    // iteration.  We might still issue encodes if things can be overlapped,
+    // even though we don't intend to output anything.
+
+    err = vaapi_encode_step(avctx, pic);
+    if (err < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Encode failed: %d.\n", err);
+        goto fail;
+    }
+
+    if (!pic) {
+        *got_packet = 0;
+    } else {
+        err = vaapi_encode_output(avctx, pic, pkt);
+        if (err < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Output failed: %d.\n", err);
+            goto fail;
+        }
+
+        if (ctx->output_delay == 0) {
+            pkt->dts = pkt->pts;
+        } else if (ctx->output_order < ctx->decode_delay) {
+            if (ctx->ts_ring[ctx->output_order] < INT64_MIN + ctx->dts_pts_diff)
+                pkt->dts = INT64_MIN;
+            else
+                pkt->dts = ctx->ts_ring[ctx->output_order] - ctx->dts_pts_diff;
+        } else {
+            pkt->dts = ctx->ts_ring[(ctx->output_order - ctx->decode_delay) %
+                                    (3 * ctx->output_delay)];
+        }
+
+        *got_packet = 1;
+    }
+
+    err = vaapi_encode_h264_clear_old(avctx);
+    if (err < 0) {
+        av_log(avctx, AV_LOG_ERROR, "List clearing failed: %d.\n", err);
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    // Unclear what to clean up on failure.  There are probably some things we
+    // could do usefully clean up here, but for now just leave them for uninit()
+    // to do instead.
+    return err;
+}
+
+
 #define OFFSET(x) (offsetof(VAAPIEncodeContext, codec_options_data) + \
                    offsetof(VAAPIEncodeH264Options, x))
 #define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM)
@@ -1086,7 +1493,7 @@ AVCodec ff_h264_vaapi_encoder = {
     .priv_data_size = (sizeof(VAAPIEncodeContext) +
                        sizeof(VAAPIEncodeH264Options)),
     .init           = &vaapi_encode_h264_init,
-    .encode2        = &ff_vaapi_encode2,
+    .encode2        = &vaapi_encode_h264_encode,
     .close          = &vaapi_encode_h264_close,
     .priv_class     = &vaapi_encode_h264_class,
     .capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE,
