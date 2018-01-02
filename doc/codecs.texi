@@ -1254,18 +1254,31 @@ ffprobe -dump_separator "
 Maximum number of pixels per image. This value can be used to avoid out of
 memory failures due to large images.
 
-@item  -hwaccel_flags  @var{flags} (@emph{decoding,video})
+@item hwaccel_flags @var{flags} (@emph{decoding,video})
+Set hardware accelerated decoding flags. (if active)
+
 Possible values:
 @table @samp
 @item ignore_level
-ignore level even if the codec level used is unknown or higher than the maximum
-supported level reported by the hardware driver
+Ignore level, should be used for decoding even if the codec level used is unknown
+or higher than the maximum supported level reported by the hardware driver.
+
+It's generally a good idea to pass this flag unless you have a specific
+reason not to, as hardware tends to under-report supported levels.
 @item allow_high_depth
-allow to output YUV pixel formats with a different chroma sampling than 4:2:0
+Allow to output YUV pixel formats with a different chroma sampling than 4:2:0
 and/or other than 8 bits per component
 @item allow_profile_mismatch
-attempt to decode anyway if HW accelerated decoder's supported profiles do not
-exactly match the stream
+Attempt to decode anyway if hardware accelerated decoder's supported profiles do not
+exactly match the stream.
+
+For example, this can be used to try to decode baseline profile H.264
+streams in hardware - it will often succeed, because many streams marked
+as baseline profile actually conform to constrained baseline profile.
+
+Warning: If the stream is actually not supported then the behaviour is
+undefined, and may include returning entirely incorrect output
+while indicating success.
 @end table
 
 @item apply_cropping @var{bool} (@emph{decoding,video})
